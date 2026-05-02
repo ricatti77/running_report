@@ -78,18 +78,19 @@ def load_members() -> dict:
 # ─── Runalyze API: 2단계 방식 ─────────────────────────────────────────────────
 BASE = "https://runalyze.com/api/v1"
 
+def runalyze_headers(token: str) -> dict:
+    return {
+        "Authorization": f"Token {token}",
+        "Content-Type": "application/json",
+    }
+
 def get_activity_ids(token: str, year: int, month: int) -> list[int]:
-    """
-    1단계: POST /api/v1/sync/changes
-    월 시작 타임스탬프 이후 변경된 활동 ID 목록 반환
-    """
     since = f"{year}-{month:02d}-01T00:00:00Z"
     try:
         r = requests.post(
             f"{BASE}/sync/changes",
-            params={"token": token},
+            headers=runalyze_headers(token),
             json={"activities": since},
-            headers={"Content-Type": "application/json"},
             timeout=15,
         )
         r.raise_for_status()
@@ -101,14 +102,10 @@ def get_activity_ids(token: str, year: int, month: int) -> list[int]:
         return []
 
 def get_activity_detail(token: str, activity_id: int) -> dict | None:
-    """
-    2단계: GET /api/v1/activity/{id}
-    단건 상세 조회
-    """
     try:
         r = requests.get(
             f"{BASE}/activity/{activity_id}",
-            params={"token": token},
+            headers=runalyze_headers(token),
             timeout=10,
         )
         if r.status_code == 404:
