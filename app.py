@@ -138,12 +138,12 @@ div[data-testid="stExpander"] {
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 MEMBER_COLORS = {
-    "병희": "#00FF87",
-    "지현": "#FF6B6B",
-    "민준": "#38BDF8",
-    "서연": "#FFD93D",
-    "태양": "#C084FC",
-    "현우": "#FB923C",
+    "김병희": "#00FF87",
+    "이재훈": "#FF6B6B",
+    "이효민": "#38BDF8",
+    "이종현": "#FFD93D",
+    "조윤래": "#C084FC",
+    "임정우": "#FB923C",
 }
 RANK_ICONS = ["🥇", "🥈", "🥉", "4위", "5위", "☕"]
 
@@ -160,20 +160,21 @@ def load_members():
 # ─── Runalyze API ─────────────────────────────────────────────────────────────
 def fetch_activities(token: str, year: int, month: int) -> list:
     last_day = calendar.monthrange(year, month)[1]
+    # sport 파라미터 제거 — 전체 가져온 뒤 러닝만 필터링
     params = {
         "token":  token,
-        "sport":  1,
         "after":  f"{year}-{month:02d}-01",
         "before": f"{year}-{month:02d}-{last_day:02d}",
         "limit":  200,
     }
     try:
-        r = requests.get("https://runalyze.com/api/v1/activities", params=params, timeout=10)
+        r = requests.get("https://runalyze.com/api/v1/activities", params=params, timeout=15)
         r.raise_for_status()
         data = r.json()
-        if isinstance(data, list):
-            return data
-        return data.get("data") or data.get("activities") or []
+        raw = data if isinstance(data, list) else (data.get("data") or data.get("activities") or [])
+        # sport 필드가 있으면 러닝(1)만, 없으면 전체 반환
+        running = [a for a in raw if a.get("sport") in (1, "1", None, "running", "")]
+        return running if running else raw
     except requests.exceptions.RequestException as e:
         st.warning(f"API 오류: {e}")
         return []
@@ -278,24 +279,24 @@ def main():
     st.markdown('<div class="section-label">이번달 순위</div>', unsafe_allow_html=True)
     cols = st.columns(3)
     for i, t in enumerate(totals):
-        color     = MEMBER_COLORS.get(t["name"], "#888")
-        is_first  = i == 0
-        card_cls  = "rank-card first" if is_first else "rank-card"
-        live_dot  = f'<span class="dot-live" style="background:{color};box-shadow:0 0 8px {color}"></span>' if t["name"] in members else ""
-        live_txt  = "🔗 RUNALYZE LIVE" if t["name"] in members else "토큰 미등록"
-
+        color    = MEMBER_COLORS.get(t["name"], "#888")
+        live_txt = "🔗 RUNALYZE LIVE" if t["name"] in members else "미연동"
+        border   = f"2px solid {color}" if i == 0 else "1px solid #1a2540"
+        bg       = "linear-gradient(145deg,#0c1f15,#0d1e2a)" if i == 0 else "#0a101f"
         with cols[i % 3]:
-            st.markdown(f"""
-            <div class="{card_cls}">
-                <div style="display:flex;justify-content:space-between;align-items:flex-start">
-                    <span class="rank-icon">{RANK_ICONS[i]}</span>
-                    {live_dot}
-                </div>
-                <div class="rank-name">{t['name']}</div>
-                <div class="rank-km" style="color:{color}">{t['km']:.1f}<span style="font-size:0.75rem;color:#3d5270;margin-left:4px">km</span></div>
-                <div class="rank-sub">{t['runs']}회 활동 · {live_txt}</div>
-            </div>
-            """, unsafe_allow_html=True)
+            st.markdown(
+                f'<div style="background:{bg};border:{border};border-radius:16px;padding:18px 20px;margin-bottom:8px">'
+                f'<div style="display:flex;justify-content:space-between;align-items:flex-start">'
+                f'<span style="font-size:1.3rem">{RANK_ICONS[i]}</span>'
+                f'<span style="width:8px;height:8px;border-radius:50%;background:{color};box-shadow:0 0 8px {color};display:inline-block;margin-top:4px"></span>'
+                f'</div>'
+                f'<div style="font-family:Bebas Neue,sans-serif;font-size:1.5rem;letter-spacing:2px;color:#e8f0ff;margin-top:8px">{t["name"]}</div>'
+                f'<div style="font-family:Bebas Neue,sans-serif;font-size:2rem;letter-spacing:1px;color:{color}">{t["km"]:.1f}'
+                f'<span style="font-size:0.75rem;color:#3d5270;margin-left:4px">km</span></div>'
+                f'<div style="font-size:0.62rem;letter-spacing:1.5px;color:#2d4a3a;margin-top:3px">{t["runs"]}회 활동 · {live_txt}</div>'
+                f'</div>',
+                unsafe_allow_html=True
+            )
 
     st.markdown("<br>", unsafe_allow_html=True)
 
