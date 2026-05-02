@@ -4,6 +4,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime
 import calendar
+import time
 
 # ─── Page config ─────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -41,7 +42,9 @@ html, body, [class*="css"] { font-family: 'Sora', sans-serif; background-color: 
     font-size: 0.85rem; padding: 0.4rem 1.2rem;
 }
 .stButton > button:hover { background: #00FF8733; border-color: #00FF87; }
-div[data-testid="stExpander"] { background: #080e1d; border: 1px solid #141e33 !important; border-radius: 14px !important; }
+div[data-testid="stExpander"] {
+    background: #080e1d; border: 1px solid #141e33 !important; border-radius: 14px !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -49,7 +52,6 @@ div[data-testid="stExpander"] { background: #080e1d; border: 1px solid #141e33 !
 DEFAULT_COLORS = [
     "#00FF87", "#FF6B6B", "#38BDF8", "#FFD93D",
     "#C084FC", "#FB923C", "#34D399", "#F472B6",
-    "#60A5FA", "#FBBF24",
 ]
 FIXED_COLORS = {
     "병희": "#00FF87", "지현": "#FF6B6B", "민준": "#38BDF8",
@@ -73,72 +75,114 @@ def load_members() -> dict:
     except Exception:
         return {"병희": "f82e663c3debe6d882d74aee8a22228a"}
 
-# ─── Runalyze API ─────────────────────────────────────────────────────────────
-def fetch_activities(token: str, year: int, month: int) -> list:
-    last_day = calendar.monthrange(year, month)[1]
-    date_params = {
-        "after":  f"{year}-{month:02d}-01",
-        "before": f"{year}-{month:02d}-{last_day:02d}",
-        "limit":  200,
-    }
+# ─── Runalyze API: 2단계 방식 ─────────────────────────────────────────────────
+BASE = "https://runalyze.com/api/v1"
 
-    # 방법 1: token을 쿼리 파라미터로
-    endpoints = [
-        "https://runalyze.com/api/v1/activities",
-        "https://runalyze.com/api/v1/training",
-    ]
-    for ep in endpoints:
-        try:
-            r = requests.get(ep, params={"token": token, **date_params}, timeout=15)
-            if r.status_code == 404:
-                continue
-            r.raise_for_status()
-            data = r.json()
-            raw = data if isinstance(data, list) else (
-                data.get("data") or data.get("activities") or
-                data.get("trainings") or []
-            )
-            return raw or []
-        except Exception:
-            continue
-
-    # 방법 2: Authorization 헤더로
+def get_activity_ids(token: str, year: int, month: int) -> list[int]:
+    """
+    1단계: POST /api/v1/sync/changes
+    월 시작 타임스탬프 이후 변경된 활동 ID 목록 반환
+    """
+    since = f"{year}-{month:02d}-01T00:00:00Z"
     try:
-        r = requests.get(
-            "https://runalyze.com/api/v1/activities",
-            headers={"Authorization": f"Token {token}"},
-            params=date_params,
+        r = requests.post(
+            f"{BASE}/sync/changes",
+            params={"token": token},
+            json={"activities": since},
+            headers={"Content-Type": "application/json"},
             timeout=15,
         )
         r.raise_for_status()
         data = r.json()
-        raw = data if isinstance(data, list) else (data.get("data") or data.get("activities") or [])
-        return raw or []
-    except requests.exceptions.RequestException as e:
-        st.warning(f"⚠️ Runalyze API 연결 실패: {e}")
+        ids = data.get("activities", [])
+        return [int(i) for i in ids if i]
+    except Exception as e:
+        st.warning(f"⚠️ sync/changes 오류: {e}")
         return []
+
+def get_activity_detail(token: str, activity_id: int) -> dict | None:
+    """
+    2단계: GET /api/v1/activity/{id}
+    단건 상세 조회
+    """
+    try:
+        r = requests.get(
+            f"{BASE}/activity/{activity_id}",
+            params={"token": token},
+            timeout=10,
+        )
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+def fetch_activities(token: str, year: int, month: int) -> list:
+    """전체 흐름: ID 목록 조회 → 상세 조회 → 해당 월 필터링"""
+    ids = get_activity_ids(token, year, month)
+    if not ids:
+        return []
+
+    last_day = calendar.monthrange(year, month)[1]
+    month_start = datetime(year, month, 1)
+    month_end   = datetime(year, month, last_day, 23, 59, 59)
+
+    activities = []
+    # 최대 100개 제한 (너무 많으면 느려짐)
+    for act_id in ids[:100]:
+        detail = get_activity_detail(token, act_id)
+        if not detail:
+            continue
+        # 날짜 파싱해서 해당 월인지 확인
+        raw_date = detail.get("date") or detail.get("time") or ""
+        try:
+            act_date = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+            if not (month_start <= act_date.replace(tzinfo=None) <= month_end):
+                continue
+        except Exception:
+            # 날짜 파싱 실패 시 일단 포함
+            pass
+        activities.append(detail)
+        time.sleep(0.05)  # API 부하 방지
+
+    return activities
 
 def parse_activities(raw: list) -> pd.DataFrame:
     if not raw:
         return pd.DataFrame()
     rows = []
     for a in raw:
-        cad = a.get("avgCadence") or 0
+        # Runalyze activity 필드명 대응 (여러 케이스)
+        dist = (
+            a.get("distance") or a.get("dist") or
+            a.get("distance_m") or 0
+        )
+        dist_km = dist / 1000 if dist > 10 else dist  # m → km 변환
+
+        cad = a.get("avgCadence") or a.get("cadence") or 0
+        raw_date = a.get("date") or a.get("time") or ""
+        try:
+            parsed_date = datetime.fromisoformat(raw_date.replace("Z", "+00:00")).strftime("%Y-%m-%d")
+        except Exception:
+            parsed_date = raw_date[:10] if len(raw_date) >= 10 else raw_date
+
         rows.append({
-            "date":      a.get("date", ""),
-            "dist_km":   round((a.get("distance") or 0) / 1000, 2),
-            "duration":  a.get("duration") or 0,
+            "date":      parsed_date,
+            "dist_km":   round(dist_km, 2),
+            "duration":  a.get("duration") or a.get("s") or 0,
             "pace_s":    a.get("pace") or 0,
-            "avg_hr":    a.get("avgHeartRate") or 0,
-            "max_hr":    a.get("maxHeartRate") or 0,
+            "avg_hr":    a.get("avgHeartRate") or a.get("heartRateAvg") or 0,
+            "max_hr":    a.get("maxHeartRate") or a.get("heartRateMax") or 0,
             "cadence":   round(cad * 2) if cad > 0 else 0,
-            "elevation": a.get("elevation") or 0,
+            "elevation": a.get("elevation") or a.get("elevUp") or 0,
         })
     df = pd.DataFrame(rows)
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df = df.dropna(subset=["date"]).sort_values("date", ascending=False).reset_index(drop=True)
     return df
 
+# ─── Formatters ───────────────────────────────────────────────────────────────
 def fmt_pace(s):
     if not s or s <= 0: return "—"
     return f"{int(s//60)}'{int(s%60):02d}\""
@@ -149,6 +193,7 @@ def fmt_dur(s):
     m, sec = divmod(rem, 60)
     return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
 
+# ─── Card renderer ────────────────────────────────────────────────────────────
 def render_card(icon, name, km, runs, color, is_live, is_first):
     border = f"2px solid {color}" if is_first else "1px solid #1a2540"
     bg     = "linear-gradient(145deg,#0c1f15,#0d1e2a)" if is_first else "#0a101f"
@@ -171,11 +216,11 @@ def render_card(icon, name, km, runs, color, is_live, is_first):
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
-    members = load_members()
+    members      = load_members()
     member_names = list(members.keys())
-    now = datetime.now()
+    now          = datetime.now()
 
-    # Header
+    # ── Header
     col_title, col_ctrl = st.columns([2, 1])
     with col_title:
         st.markdown('<div class="run-title">RUN CREW</div>', unsafe_allow_html=True)
@@ -185,74 +230,98 @@ def main():
         opts = []
         for i in range(13):
             mo, yr = now.month - i, now.year
-            while mo <= 0: mo += 12; yr -= 1
+            while mo <= 0:
+                mo += 12; yr -= 1
             opts.append((yr, mo))
         sel_year, sel_month = st.selectbox(
-            "월", opts, format_func=lambda x: f"{x[0]}년 {x[1]}월",
-            label_visibility="collapsed"
+            "월", opts,
+            format_func=lambda x: f"{x[0]}년 {x[1]}월",
+            label_visibility="collapsed",
         )
 
-    # Fetch
+    # ── Fetch
     if "cache" not in st.session_state:
         st.session_state.cache = {}
     cache_key = f"{sel_year}-{sel_month}"
 
-    if st.button("↻ 새로고침") or cache_key not in st.session_state.cache:
-        with st.spinner("데이터 불러오는 중..."):
-            result = {}
-            for name, token in members.items():
-                result[name] = parse_activities(fetch_activities(token, sel_year, sel_month))
-            st.session_state.cache[cache_key] = result
+    do_refresh = st.button("↻ 새로고침")
+    if do_refresh or cache_key not in st.session_state.cache:
+        progress = st.progress(0, text="데이터 불러오는 중...")
+        result   = {}
+        total_m  = len(member_names)
+        for idx, (name, token) in enumerate(members.items()):
+            progress.progress(
+                int((idx / total_m) * 100),
+                text=f"[{idx+1}/{total_m}] {name} 데이터 조회 중..."
+            )
+            raw = fetch_activities(token, sel_year, sel_month)
+            result[name] = parse_activities(raw)
+        progress.progress(100, text="완료!")
+        time.sleep(0.5)
+        progress.empty()
+        st.session_state.cache[cache_key] = result
 
     data = st.session_state.cache.get(cache_key, {})
 
-    # Totals
-    totals = sorted([
-        {"name": n, "km": round(data.get(n, pd.DataFrame()).get("dist_km", pd.Series()).sum(), 1) if not data.get(n, pd.DataFrame()).empty else 0.0,
-         "runs": len(data.get(n, pd.DataFrame())), "idx": i}
-        for i, n in enumerate(member_names)
-    ], key=lambda x: x["km"], reverse=True)
+    # ── Totals
+    totals = []
+    for i, name in enumerate(member_names):
+        df   = data.get(name, pd.DataFrame())
+        km   = round(float(df["dist_km"].sum()), 1) if not df.empty else 0.0
+        runs = len(df)
+        totals.append({"name": name, "km": km, "runs": runs, "idx": i})
+    totals.sort(key=lambda x: x["km"], reverse=True)
     N = len(totals)
 
-    # Ranking cards
+    # ── Ranking cards
     st.markdown('<div class="section-label">이번달 순위</div>', unsafe_allow_html=True)
     cols = st.columns(3)
     for i, t in enumerate(totals):
         with cols[i % 3]:
-            render_card(get_rank_icon(i, N), t["name"], t["km"], t["runs"],
-                        get_color(t["name"], t["idx"]), t["name"] in members, i == 0)
+            render_card(
+                get_rank_icon(i, N), t["name"], t["km"], t["runs"],
+                get_color(t["name"], t["idx"]),
+                t["name"] in members, i == 0,
+            )
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # Charts
+    # ── Charts
     st.markdown('<div class="section-label">누적 거리 현황</div>', unsafe_allow_html=True)
     tab1, tab2 = st.tabs(["📊 멤버 비교 막대", "📈 일별 추이"])
 
     with tab1:
         fig = go.Figure(go.Bar(
             x=[t["name"] for t in totals],
-            y=[t["km"] for t in totals],
-            marker=dict(color=[get_color(t["name"], t["idx"]) for t in totals], line=dict(width=0)),
+            y=[t["km"]   for t in totals],
+            marker=dict(
+                color=[get_color(t["name"], t["idx"]) for t in totals],
+                line=dict(width=0),
+            ),
             text=[f"{t['km']:.1f}" for t in totals],
-            textposition="outside", textfont=dict(color="#c8d8f0", size=13),
+            textposition="outside",
+            textfont=dict(color="#c8d8f0", size=13),
         ))
         fig.update_layout(
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
             font=dict(color="#c8d8f0"),
             xaxis=dict(showgrid=False, tickfont=dict(size=14)),
             yaxis=dict(showgrid=True, gridcolor="#141e33", title="km"),
-            margin=dict(t=30, b=10, l=0, r=0), height=300, bargap=0.35,
+            margin=dict(t=30, b=10, l=0, r=0),
+            height=300, bargap=0.35,
         )
         st.plotly_chart(fig, use_container_width=True)
 
     with tab2:
-        fig2 = go.Figure()
+        fig2     = go.Figure()
         last_day = calendar.monthrange(sel_year, sel_month)[1]
         today_d  = now.day if (sel_year == now.year and sel_month == now.month) else last_day
         has_data = False
+
         for idx, name in enumerate(member_names):
             df = data.get(name, pd.DataFrame())
-            if df.empty: continue
+            if df.empty:
+                continue
             has_data = True
             color = get_color(name, idx)
             daily = {}
@@ -260,14 +329,17 @@ def main():
                 if pd.notna(row["date"]):
                     daily[row["date"].day] = daily.get(row["date"].day, 0) + row["dist_km"]
             days = list(range(1, today_d + 1))
-            r, g, b = int(color[1:3],16), int(color[3:5],16), int(color[5:7],16)
+            r, g, b = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
             fig2.add_trace(go.Scatter(
                 x=[f"{d}일" for d in days],
                 y=[round(daily.get(d, 0), 2) for d in days],
                 mode="lines+markers", name=name,
-                line=dict(color=color, width=2.5), marker=dict(size=5, color=color),
-                fill="tozeroy", fillcolor=f"rgba({r},{g},{b},0.07)",
+                line=dict(color=color, width=2.5),
+                marker=dict(size=5, color=color),
+                fill="tozeroy",
+                fillcolor=f"rgba({r},{g},{b},0.07)",
             ))
+
         fig2.update_layout(
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
             font=dict(color="#c8d8f0"),
@@ -283,7 +355,7 @@ def main():
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # Detail expanders
+    # ── Detail expanders
     st.markdown('<div class="section-label">멤버 상세 기록</div>', unsafe_allow_html=True)
     for i, t in enumerate(totals):
         name  = t["name"]
@@ -306,14 +378,18 @@ def main():
             ]:
                 with col:
                     st.markdown(
-                        f'<div class="stat-box"><div class="stat-label">{lbl}</div>'
-                        f'<div class="stat-value" style="color:{clr};">{val}</div></div>',
+                        f'<div class="stat-box">'
+                        f'<div class="stat-label">{lbl}</div>'
+                        f'<div class="stat-value" style="color:{clr};">{val}</div>'
+                        f'</div>',
                         unsafe_allow_html=True
                     )
 
             if not df.empty:
                 st.markdown("<br>", unsafe_allow_html=True)
-                last_d = calendar.monthrange(sel_year, sel_month)[1]
+
+                # 누적 차트
+                last_d   = calendar.monthrange(sel_year, sel_month)[1]
                 today_d2 = now.day if (sel_year == now.year and sel_month == now.month) else last_d
                 daily_map = {}
                 for _, row in df.iterrows():
@@ -322,12 +398,16 @@ def main():
                 days2 = list(range(1, today_d2 + 1))
                 cum, s = [], 0
                 for d in days2:
-                    s += daily_map.get(d, 0); cum.append(round(s, 2))
-                r, g, b = int(color[1:3],16), int(color[3:5],16), int(color[5:7],16)
+                    s += daily_map.get(d, 0)
+                    cum.append(round(s, 2))
+
+                r, g, b = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
                 fig3 = go.Figure(go.Scatter(
                     x=[f"{d}일" for d in days2], y=cum,
-                    mode="lines+markers", line=dict(color=color, width=2.5),
-                    marker=dict(size=4, color=color), fill="tozeroy",
+                    mode="lines+markers",
+                    line=dict(color=color, width=2.5),
+                    marker=dict(size=4, color=color),
+                    fill="tozeroy",
                     fillcolor=f"rgba({r},{g},{b},0.12)",
                 ))
                 fig3.update_layout(
@@ -335,10 +415,12 @@ def main():
                     font=dict(color="#c8d8f0"),
                     xaxis=dict(showgrid=False, tickfont=dict(size=10)),
                     yaxis=dict(showgrid=True, gridcolor="#141e33", title="km"),
-                    margin=dict(t=10, b=10, l=0, r=0), height=220, showlegend=False,
+                    margin=dict(t=10, b=10, l=0, r=0),
+                    height=220, showlegend=False,
                 )
                 st.plotly_chart(fig3, use_container_width=True)
 
+                # 상세 테이블
                 disp = df.copy()
                 disp["날짜"]     = disp["date"].dt.strftime("%Y-%m-%d")
                 disp["거리(km)"] = disp["dist_km"]
@@ -353,10 +435,11 @@ def main():
                     use_container_width=True, hide_index=True,
                 )
             else:
-                st.info("이 달 기록이 없습니다.")
+                st.info("이 달 기록이 없습니다." if name in members else "토큰이 등록되지 않은 멤버입니다.")
 
     st.markdown(
-        f'<div style="text-align:center;color:#141e33;font-size:0.65rem;letter-spacing:2px;margin-top:3rem;">'
+        f'<div style="text-align:center;color:#141e33;font-size:0.65rem;'
+        f'letter-spacing:2px;margin-top:3rem;">'
         f'POWERED BY RUNALYZE · {sel_year}년 {sel_month}월 · RUN CREW</div>',
         unsafe_allow_html=True
     )
